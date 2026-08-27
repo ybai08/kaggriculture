@@ -561,6 +561,10 @@ GENOME_SPEC = {
     "distance_weight": (4, 1, 12, "int"),
     "urgent_build": (True, 0, 1, "bool"),
     "plan_selector": (False, 0, 1, "bool"),
+    "feed_wheat_tiles_per_animal": (1.0, 0.0, 2.0, "float"),
+    "fill_empty_tiles": (True, 0, 1, "bool"),
+    "fill_min_days_left": (5, 3, 12, "int"),
+    "plant_priority": (3, 1, 4, "int"),
     "hire_last_hour": (10, 0, 23, "int"),
     # --- selling ---------------------------------------------------------
     "sell_floor_strawberry": (0.45, 0.05, 1.0, "float"),
@@ -1214,6 +1218,12 @@ class Planner:
             )
         if g.carrot_start_day <= day <= g.carrot_last_plant_day:
             targets["CARROT"] = g.carrot_target
+        # Feed: a wheat tile yields ~1 wheat/day, one animal eats 1/day. Growing feed
+        # is far cheaper than buying it (a self-play game bought 230 wheat for ~$10k).
+        animals = world.animal_count() + sum(world.shed.get(a, 0) for a in ANIMAL_ROLES)
+        if animals and day <= g.wheat_last_plant_day and world.days_left >= 5:
+            feed_tiles = int(animals * g.feed_wheat_tiles_per_animal + 0.5)
+            targets["WHEAT"] = max(targets.get("WHEAT", 0), feed_tiles)
         # Price-responsive staples: scarcity (town demand above supply) raises the
         # wheat/carrot price well above base; grow more of them while it lasts.
         if day >= g.shop_check_day:
@@ -1299,6 +1309,22 @@ class Planner:
                     break
                 pos = free.pop(0)
                 roles[pos] = crop
+        # Idle land earns nothing: late in the game fill leftovers with the quick
+        # staples that still finish (carrot 3 days, wheat 4 days), price-ranked.
+        if free and self.g.fill_empty_tiles and world.days_left >= self.g.fill_min_days_left:
+            wheat_value = 4 * world.prices.get("WHEAT", 25) / 5 - 10 / 5
+            carrot_value = 3 * world.prices.get("CARROT", 35) / 4 - 20 / 4
+            filler = (
+                "CARROT"
+                if carrot_value > wheat_value and world.day >= self.g.carrot_start_day - 8
+                else "WHEAT"
+            )
+            if world.day <= (
+                self.g.carrot_last_plant_day if filler == "CARROT" else self.g.wheat_last_plant_day
+            ):
+                for pos in free:
+                    roles[pos] = filler
+                free = []
         for pos in free:
             roles[pos] = None
         memory.roles = roles
@@ -1690,7 +1716,12 @@ class Executor:
             if crop == "TOMATO" and g.fertilize_tomato and age in (7, 8, 10):
                 want = True
             if want and world.day + 1 <= world.final_day:
-                jobs.append(Job(PRIORITY_HARVEST, pos, ["FERTILIZE"], item="FERTILIZER"))
+                # Last chance for this production pair: treat it like a dying plant.
+                last_chance = (crop == "STRAWBERRY" and age in (10, 14)) or (
+                    crop == "TOMATO" and age in (8, 10)
+                )
+                priority = PRIORITY_DIE if last_chance else PRIORITY_HARVEST
+                jobs.append(Job(priority, pos, ["FERTILIZE"], item="FERTILIZER"))
         return jobs
 
     @staticmethod
@@ -1795,7 +1826,7 @@ class Executor:
                     and world.days_left >= CROPS[role]["first_yield_day"]
                 ):
                     plant_needs[role] = plant_needs.get(role, 0) + 1
-                    jobs.append(Job(PRIORITY_PLANT, pos, ["PLANT", role], plant_crop=role))
+                    jobs.append(Job(self.g.plant_priority, pos, ["PLANT", role], plant_crop=role))
         return jobs
 
     # ------------------------------------------------------------------
@@ -2083,62 +2114,67 @@ def run_agent(obs, configuration=None, genome=None, time_budget=0.5):
 # Kaggle entry point. Must remain the LAST top-level callable in this file.
 # ---------------------------------------------------------------------------
 CHAMPION_GENOME = {'animal_cash_reserve': 150,
- 'animal_last_buy_day': 18,
+ 'animal_last_buy_day': 17,
  'care_animals': True,
  'care_min_price_fraction': 0.25,
  'carrot_last_plant_day': 27,
- 'carrot_start_day': 22,
+ 'carrot_start_day': 18,
  'carrot_target': 12,
  'cows_no_milk_shop_cap': 5,
  'cows_per_milk_shop': 3,
  'demand_share': 0.6,
- 'distance_weight': 4,
+ 'distance_weight': 1,
  'feed_buffer_days': 2,
+ 'feed_wheat_tiles_per_animal': 1.0,
  'fertilize_strawberry': True,
  'fertilize_tomato': False,
  'fertilizer_base_reserve': 4,
+ 'fill_empty_tiles': False,
+ 'fill_min_days_left': 3,
  'geese_per_egg_shop': 0,
- 'hands_early': 4,
+ 'hands_early': 7,
  'hands_late': 9,
  'hands_late_start_day': 25,
  'hands_mid': 14,
  'hands_mid_start_day': 7,
  'hire_cash_reserve': 0,
- 'hire_last_hour': 15,
- 'labor_extra': 2,
- 'land_cash_reserve': 339,
+ 'hire_last_hour': 11,
+ 'labor_extra': 3,
+ 'land_cash_reserve': 519,
  'land_ne_day': 5,
- 'land_se_day': 82,
+ 'land_se_day': 92,
  'land_sw_day': 15,
  'liquidation_day': 29,
  'melon_last_plant_day': 0,
  'opening_cows': 3,
  'opening_hands': 4,
- 'opening_melon': 11,
- 'opening_sheep': 3,
- 'opening_wheat': 10,
- 'opponent_dump_sensitivity': 0.030740757931349838,
+ 'opening_melon': 9,
+ 'opening_sheep': 2,
+ 'opening_wheat': 13,
+ 'opponent_dump_sensitivity': 0.31109985639682286,
  'opponent_supply_sensitivity': 0.34645928794825276,
- 'price_boost_factor': 1.4456976844488132,
+ 'plan_selector': False,
+ 'plant_priority': 3,
+ 'price_boost_factor': 1.3206184670750414,
  'price_boost_threshold': 1.4,
- 'seed_cash_reserve': 24,
- 'sell_floor_carrot': 0.45,
+ 'seed_cash_reserve': 0,
+ 'sell_floor_carrot': 0.40397394859483027,
  'sell_floor_cash_relief': 0.5,
- 'sell_floor_egg': 0.55,
+ 'sell_floor_egg': 0.4521581359027682,
  'sell_floor_fertilizer': 0.45,
  'sell_floor_melon': 0.35,
  'sell_floor_milk': 0.45,
  'sell_floor_strawberry': 0.41315651153654875,
- 'sell_floor_tomato': 0.223284582239443,
+ 'sell_floor_tomato': 0.3778874273158702,
  'sell_floor_wheat': 0.4275185342342801,
  'sell_floor_wool': 0.43611031269089295,
  'shed_pressure_level': 53,
  'sheep_no_store_cap': 3,
  'sheep_per_yarn_store': 8,
  'sheep_require_yarn_store': True,
- 'shop_check_day': 8,
+ 'shop_check_day': 10,
  'skip_optional_water': True,
- 'strawberry_last_plant_day': 16,
+ 'strawberry_last_plant_day': 12,
  'strawberry_start_day': 2,
  'strawberry_target': 30,
  'target_cows': 7,
@@ -2146,7 +2182,8 @@ CHAMPION_GENOME = {'animal_cash_reserve': 150,
  'target_sheep': 2,
  'tomato_last_plant_day': 18,
  'tomato_start_day': 13,
- 'tomato_target': 5,
+ 'tomato_target': 2,
+ 'urgent_build': True,
  'wheat_last_plant_day': 24,
  'wheat_target': 8}
 
