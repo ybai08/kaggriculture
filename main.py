@@ -3401,3 +3401,240 @@ def agent(observation, configuration=None):
     except Exception:
         pass
     return _F1_PARENT(observation, configuration)
+
+
+
+# ---------------------------------------------------------------------------
+# Value-timed selling layer VS (grafted). Builds a per-day price projection for
+# every product from three known things: the unlocked shops' consumption (plus
+# the expected consumption of the shop draws still to come), the opponent's
+# future harvests read off their visible farm, and our own supply mapped onto
+# this route's scheduled sale days. For the crash-prone products it then holds a
+# planned SELL when a later day is projected clearly better (and the shed has
+# room), or adds an impact-capped SELL when today clearly beats every later day.
+# Measured on research/value_layer.py (the wrapper this was inlined from):
+# +$300-500 per game on every opponent, win counts unchanged. Stdlib only.
+# ---------------------------------------------------------------------------
+_VS_PARENT = agent
+del agent
+
+_VS_PARAMS = {
+    "products": ("MILK", "WOOL", "STRAWBERRY", "MELON", "EGG"),
+    "hold_margin": 0.10,
+    "sell_margin": 0.10,
+    "horizon": 6,
+    "impact_cap": 0.95,
+    "room_min": 15,
+    "last_day": 27,
+    "capacity": 100,
+}
+_VS_FINAL_DAY = 29
+_VS_UNLOCK_DAYS = (3, 6, 9, 12, 15, 18, 21, 24)
+_VS_MAX_SHOPS = 8
+_VS_PRODUCTS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON", "EGG", "MILK", "WOOL", "FERTILIZER")
+_VS_SHOPS = {
+    "BAKERY": ("EGG", "WHEAT"),
+    "PIZZA_SHOP": ("MILK", "TOMATO", "WHEAT"),
+    "BRUNCH_SPOT": ("EGG", "WHEAT", "STRAWBERRY"),
+    "YARN_STORE": ("WOOL",),
+    "ICE_CREAM_SHOP": ("STRAWBERRY", "MILK", "WHEAT"),
+    "PET_CAFE": ("CARROT",),
+    "SMOOTHIE_SHOP": ("STRAWBERRY", "MILK"),
+    "FARMERS_MARKET": ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY"),
+}
+_VS_UNITS_PER_HARVEST = {"WHEAT": 4.0, "CARROT": 3.0, "MELON": 5.0, "STRAWBERRY": 1.3, "TOMATO": 1.3}
+_VS_ANIMAL_UNITS = {"COW": 1.5, "SHEEP": 1.33, "GOOSE": 2.0}
+_VS_ANIMAL_PRODUCT = {"COW": "MILK", "SHEEP": "WOOL", "GOOSE": "EGG"}
+_VS_CROPS = _UNIT_NS["CROPS"]
+_VS_ANIMALS = _UNIT_NS["ANIMALS"]
+_VS_STATS = {"held": 0, "added": 0, "errors": 0}
+_VS_SCHEDULES = {}
+
+
+def _vs_daily_consumption(shops):
+    out = {p: 0.0 for p in _VS_PRODUCTS}
+    for shop in shops:
+        products = _VS_SHOPS.get(shop, ())
+        mult = 2 if len(products) == 1 else 1
+        for p in products:
+            out[p] += mult * 6
+    for p in _VS_PRODUCTS:
+        if p != "FERTILIZER":
+            out[p] += 1
+    return out
+
+
+def _vs_draw_consumption():
+    out = {p: 0.0 for p in _VS_PRODUCTS}
+    for products in _VS_SHOPS.values():
+        mult = 2 if len(products) == 1 else 1
+        for p in products:
+            out[p] += mult * 6 / len(_VS_SHOPS)
+    return out
+
+
+def _vs_consumption_forecast(shops, day):
+    base = _vs_daily_consumption(shops)
+    extra = _vs_draw_consumption()
+    room = _VS_MAX_SHOPS - len(shops)
+    unlocks = [d for d in _VS_UNLOCK_DAYS if d > day][: max(0, room)]
+    out = {}
+    for d in range(day, _VS_FINAL_DAY + 1):
+        n_new = sum(1 for u in unlocks if u <= d)
+        out[d] = {p: base[p] + n_new * extra[p] for p in _VS_PRODUCTS}
+    return out
+
+
+def _vs_supply_forecast(farm, day):
+    out = {d: {p: 0.0 for p in _VS_PRODUCTS} for d in range(day, _VS_FINAL_DAY + 1)}
+    n_animals = 0
+    for row in farm.get("tiles") or []:
+        for tile in row:
+            if not isinstance(tile, dict):
+                continue
+            if tile.get("kind") == "PLANT":
+                crop = tile["crop"]
+                data = _VS_CROPS[crop]
+                planted = tile.get("planted_day", day)
+                if data["ongoing"]:
+                    first = planted + data["first_yield_day"]
+                    for k in range(data["max_yield"]):
+                        d = first + k * data["interval"]
+                        if day <= d <= _VS_FINAL_DAY:
+                            out[d][crop] += _VS_UNITS_PER_HARVEST[crop]
+                else:
+                    if crop == "MELON":
+                        d = planted + data["first_yield_day"]
+                    else:
+                        d = planted + data["max_yield_day"]
+                    d = max(d, day)
+                    if d <= _VS_FINAL_DAY:
+                        out[d][crop] += _VS_UNITS_PER_HARVEST[crop]
+            elif "animal" in tile:
+                n_animals += 1
+                animal = tile["animal"]
+                start = max(day, tile.get("placed_day", day) + _VS_ANIMALS[animal]["first_yield_day"])
+                for d in range(start, _VS_FINAL_DAY + 1):
+                    out[d][_VS_ANIMAL_PRODUCT[animal]] += _VS_ANIMAL_UNITS[animal]
+    for d in range(day, _VS_FINAL_DAY + 1):
+        out[d]["FERTILIZER"] += 0.7 * n_animals
+    return out
+
+
+def _vs_sales_from_supply(supply, day, lag=0.5):
+    out = {d: {p: 0.0 for p in _VS_PRODUCTS} for d in range(day, _VS_FINAL_DAY + 1)}
+    for d, units in supply.items():
+        for p, u in units.items():
+            if u <= 0:
+                continue
+            if p == "MELON" or d >= _VS_FINAL_DAY:
+                out[d][p] += u
+            else:
+                out[d][p] += u * (1 - lag)
+                out[d + 1][p] += u * lag
+    return out
+
+
+def _vs_schedule(route):
+    """Days on which this route's tape sells each product."""
+    if route not in _VS_SCHEDULES:
+        days = {p: set() for p in _VS_PRODUCTS}
+        tape = _IMPL.chassis.routes.get(route, _IMPL.chassis.routes.get(0)) or []
+        for step, entry in enumerate(tape):
+            for order in (entry.get("market") or []):
+                if order and order[0] == "SELL" and len(order) >= 2 and order[1] in days:
+                    days[order[1]].add(step // 24)
+        _VS_SCHEDULES[route] = {p: sorted(s) for p, s in days.items()}
+    return _VS_SCHEDULES[route]
+
+
+def _vs_own_plan(farm, route, day):
+    supply = _vs_supply_forecast(farm, day)
+    schedule = _vs_schedule(route)
+    plan = {d: {p: 0.0 for p in _VS_PRODUCTS} for d in range(day, _VS_FINAL_DAY + 1)}
+    for d, units in supply.items():
+        for p, u in units.items():
+            if u <= 0:
+                continue
+            target = next((s for s in schedule[p] if s >= d), d)
+            plan[min(target, _VS_FINAL_DAY)][p] += u
+    return plan
+
+
+class _VsProjection:
+    def __init__(self, inventory, day, used, theirs, ours):
+        self.day = day
+        self.ours = ours
+        self.inventory = {}
+        for p in _VS_PRODUCTS:
+            inv = float(inventory.get(p, 10000))
+            path = {}
+            for d in range(day, _VS_FINAL_DAY + 1):
+                path[d] = inv
+                inv += ours.get(d, {}).get(p, 0.0) + theirs.get(d, {}).get(p, 0.0) - used.get(d, {}).get(p, 0.0)
+            self.inventory[p] = path
+
+    def price(self, product, d, extra_units=0.0):
+        path = self.inventory[product]
+        d = min(max(d, self.day), _VS_FINAL_DAY)
+        mid = path[d] + 0.5 * self.ours.get(d, {}).get(product, 0.0) + extra_units
+        return _r37_market_price(product, int(round(mid)))
+
+
+def _vs_adjust(obs, action):
+    p = _VS_PARAMS
+    step = int(obs["step"])
+    day = step // 24
+    if day > p["last_day"] or not obs.get("farms") or not isinstance(action, dict):
+        return action
+    player = int(obs["player"])
+    farm = obs["farms"][player]
+    opp = obs["farms"][1 - player]
+    shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
+    inv = dict(obs["market"]["inventory"])
+    shed = dict(obs["private"].get("shed") or {})
+    state = _IMPL.chassis.players.get(player) if isinstance(_IMPL.chassis.players, dict) else None
+    route = state.get("route", 0) if isinstance(state, dict) else 0
+    used = _vs_consumption_forecast(shops, day)
+    theirs = _vs_sales_from_supply(_vs_supply_forecast(opp, day), day)
+    ours = _vs_own_plan(farm, route, day)
+    proj = _VsProjection(inv, day, used, theirs, ours)
+    market = [list(o) for o in (action.get("market") or []) if o]
+    shed_total = sum(v for k, v in shed.items() if k in _VS_PRODUCTS)
+    carried = sum(v for i in (obs["private"].get("inventories") or []) for k, v in i.items() if k in _VS_PRODUCTS)
+    room_ok = shed_total + carried < p["capacity"] - p["room_min"]
+    changed = False
+    for item in p["products"]:
+        stock = shed.get(item, 0)
+        if stock <= 0:
+            continue
+        planned = sum(int(o[2]) for o in market if o[0] == "SELL" and len(o) >= 3 and o[1] == item)
+        now = _r37_market_price(item, inv.get(item, 10000))
+        best = 0.0
+        for d in range(day + 1, min(_VS_FINAL_DAY, day + p["horizon"]) + 1):
+            best = max(best, proj.price(item, d, stock / 2.0))
+        if planned > 0 and room_ok and best > now * (1 + p["hold_margin"]):
+            market = [o for o in market if not (o[0] == "SELL" and len(o) >= 3 and o[1] == item)]
+            _VS_STATS["held"] += planned
+            changed = True
+        elif planned == 0 and stock >= 3 and now > best * (1 + p["sell_margin"]) and len(market) < 10:
+            n = 0
+            while n < stock and _r37_market_price(item, inv.get(item, 10000) + n) >= p["impact_cap"] * now:
+                n += 1
+            if n >= 1:
+                market.append(["SELL", item, n])
+                _VS_STATS["added"] += n
+                changed = True
+    if changed:
+        action = dict(action)
+        action["market"] = market[:10]
+    return action
+
+
+def agent(observation, configuration=None):
+    action = _VS_PARENT(observation, configuration)
+    try:
+        action = _vs_adjust(observation, action)
+    except Exception:  # noqa: BLE001 - the parent action is always a valid fallback
+        _VS_STATS["errors"] += 1
+    return action
