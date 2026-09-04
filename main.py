@@ -1,3 +1,8 @@
+# Kaggriculture submission, team Yango Mango. Derived from nathanjacob's public notebook
+# "Beyond V43: what the top clusters do on turn 1" pipe-4 agent (Apache-2.0; Ahmed Berat
+# Ozer V43 chassis lineage, all upstream notices retained below), plus two layers of our
+# own appended at the end of the file: F1 front-run (opponent SELL timing) and VS
+# value-timed selling (price projection from shops, both farms and this route's tape).
 # EXP260 combined; V41 remains the frozen primary control.
 # Earlier reservation activation adapted from aurax7 Reactive V5; upstream notices retained.
 # EXP257: V39 base with funded atomic opening.
@@ -256,7 +261,7 @@ ANIMAL_COST = {"GOOSE": 300, "COW": 400, "SHEEP": 500}
 ANIMAL_STRUCTURE = {"GOOSE": "COOP", "COW": "PASTURE", "SHEEP": "PASTURE"}
 LAND_PRICES = (1000, 2000, 4000)
 MOVES = {"NORTH": (0, -1), "SOUTH": (0, 1), "EAST": (1, 0), "WEST": (-1, 0)}
-FRONT_RUN_ITEMS = ("MILK", "WOOL", "STRAWBERRY", "MELON")
+FRONT_RUN_ITEMS = ("MILK", "WOOL", "STRAWBERRY", "MELON", "EGG", "WHEAT", "CARROT", "FERTILIZER")  # v5: staples too (+$100/game vs copies, gated by opponent mode)
 LAST_ACT_STEP = 718
 PASS_ACTION = {"farmer": ["PASS"], "hands": [], "market": []}
 
@@ -1257,13 +1262,15 @@ def _v219_qualifies(obs, native):
         return False
     if farm['money'] < 12000 or obs['market']['prices']['TOMATO'] < CROP_MIN_PRICE:
         return False
-    if sum(s in ('PIZZA_SHOP','FARMERS_MARKET') for s in obs['town']['unlocked_shops']) < 3:
+    if not _ep_tomato_go(obs):
         return False
     if any(farm['tiles'][y][x] != 'LOCKED' for y in (5,6) for x in range(5,10)):
         return False
-    if obs['private']['seeds'].get('TOMATO',0) or obs['private']['shed'].get('TOMATO',0):
+    # SW layer: its own tomato tiles, seeds and shed stock must not disqualify this overlay.
+    swap = _sw_footprint(int(obs['player']))
+    if obs['private']['seeds'].get('TOMATO',0) - swap['seeds'] > 0 or (obs['private']['shed'].get('TOMATO',0) and not swap['active']):
         return False
-    if any(isinstance(t,dict) and t.get('crop')=='TOMATO' for row in farm['tiles'] for t in row):
+    if any(isinstance(t,dict) and t.get('crop')=='TOMATO' and (x,y) not in swap['tiles'] for y,row in enumerate(farm['tiles']) for x,t in enumerate(row)):
         return False
     # The investment uses spare land and new worker indices. Avoid taking over
     # any native tomato or land purchase obligation on the known own schedule.
@@ -3396,7 +3403,7 @@ def agent(observation, configuration=None):
         player = int(_f1_get(observation, "player", 0))
         state = chassis.players.get(player) if isinstance(chassis.players, dict) else None
         route = state.get("route", 0) if isinstance(state, dict) else 0
-        chassis.cfg["front_run"] = True
+        chassis.cfg["front_run"] = _om_front_run(player)
         chassis.opponent_plan = chassis.routes.get(route, chassis.routes.get(0))
     except Exception:
         pass
@@ -3427,6 +3434,7 @@ _VS_PARAMS = {
     "room_min": 15,
     "last_day": 27,
     "capacity": 100,
+    "theirs_copy_schedule": False,
 }
 _VS_FINAL_DAY = 29
 _VS_UNLOCK_DAYS = (3, 6, 9, 12, 15, 18, 21, 24)
@@ -3581,6 +3589,34 @@ class _VsProjection:
         return _r37_market_price(product, int(round(mid)))
 
 
+def _vs_projection(obs, extra_ours=None):
+    """Price projection from this observation. `extra_ours` ({day: {product: units}})
+    adds hypothetical sales of ours (used by the epoch layer to value an investment)."""
+    player = int(obs["player"])
+    day = int(obs["step"]) // 24
+    farm = obs["farms"][player]
+    opp = obs["farms"][1 - player]
+    shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
+    inv = dict(obs["market"]["inventory"])
+    state = _IMPL.chassis.players.get(player) if isinstance(_IMPL.chassis.players, dict) else None
+    route = state.get("route", 0) if isinstance(state, dict) else 0
+    used = _vs_consumption_forecast(shops, day)
+    if _VS_PARAMS.get("theirs_copy_schedule") and _om_mode(player) == "copy":
+        # a copy of the public tape sells on this route's scheduled days, like us. Off:
+        # paired play measured it at -$78/-$82 per game vs copies (the route-day placement
+        # is too sharp; the lag model was better), so the mode gates only the F1 front-run.
+        theirs = _vs_own_plan(opp, route, day)
+    else:
+        theirs = _vs_sales_from_supply(_vs_supply_forecast(opp, day), day)
+    ours = _vs_own_plan(farm, route, day)
+    if extra_ours:
+        for d, units in extra_ours.items():
+            if d in ours:
+                for p_, u in units.items():
+                    ours[d][p_] = ours[d].get(p_, 0.0) + u
+    return _VsProjection(inv, day, used, theirs, ours)
+
+
 def _vs_adjust(obs, action):
     p = _VS_PARAMS
     step = int(obs["step"])
@@ -3593,12 +3629,7 @@ def _vs_adjust(obs, action):
     shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
     inv = dict(obs["market"]["inventory"])
     shed = dict(obs["private"].get("shed") or {})
-    state = _IMPL.chassis.players.get(player) if isinstance(_IMPL.chassis.players, dict) else None
-    route = state.get("route", 0) if isinstance(state, dict) else 0
-    used = _vs_consumption_forecast(shops, day)
-    theirs = _vs_sales_from_supply(_vs_supply_forecast(opp, day), day)
-    ours = _vs_own_plan(farm, route, day)
-    proj = _VsProjection(inv, day, used, theirs, ours)
+    proj = _vs_projection(obs)
     market = [list(o) for o in (action.get("market") or []) if o]
     shed_total = sum(v for k, v in shed.items() if k in _VS_PRODUCTS)
     carried = sum(v for i in (obs["private"].get("inventories") or []) for k, v in i.items() if k in _VS_PRODUCTS)
@@ -3637,4 +3668,625 @@ def agent(observation, configuration=None):
         action = _vs_adjust(observation, action)
     except Exception:  # noqa: BLE001 - the parent action is always a valid fallback
         _VS_STATS["errors"] += 1
+    return action
+
+
+
+# ---------------------------------------------------------------------------
+# OM: opponent mode. The chassis's own layout-similarity test (_r37_similarity)
+# run every step from day 3: a streak of matching layouts marks the opponent as a
+# copy of the public tape (our own lineage), a long run of misses marks it as
+# something else. The copy-specific behaviours read the mode: F1 front-running
+# (sell one step before the copy's scheduled SELL) and the VS projection's
+# placement of the opponent's future sales (their route's days instead of a lag).
+# Until the mode is decided the copy behaviours stay on (the ladder is ~90 % copies).
+# ---------------------------------------------------------------------------
+_OM_PARAMS = {"similarity": 0.90, "copy_streak": 6, "other_streak": 48, "start_step": 72}
+_OM_STATE = {}
+
+
+def _om_update(obs):
+    player = int(obs["player"])
+    step = int(obs["step"])
+    st = _OM_STATE.get(player)
+    if st is None or step <= st["step"]:
+        st = _OM_STATE[player] = {"step": -1, "hits": 0, "misses": 0, "mode": "unknown", "decided_step": None}
+    st["step"] = step
+    if step < _OM_PARAMS["start_step"]:
+        return st
+    try:
+        sim = _r37_similarity(obs)
+    except Exception:
+        return st
+    if sim >= _OM_PARAMS["similarity"]:
+        st["hits"] += 1
+        st["misses"] = 0
+    else:
+        st["misses"] += 1
+        st["hits"] = 0
+    if st["hits"] >= _OM_PARAMS["copy_streak"] and st["mode"] != "copy":
+        st["mode"] = "copy"
+        st["decided_step"] = step
+    elif st["misses"] >= _OM_PARAMS["other_streak"] and st["mode"] != "other":
+        st["mode"] = "other"
+        st["decided_step"] = step
+    return st
+
+
+def _om_mode(player):
+    st = _OM_STATE.get(int(player))
+    return st["mode"] if st else "unknown"
+
+
+def _om_front_run(player):
+    return _om_mode(player) != "other"
+
+
+# ---------------------------------------------------------------------------
+# EP: unlock epochs. A shop is drawn at the end of every third day (days 3..24,
+# at most eight). At hour 0 of each unlock day the layer records the epoch (day,
+# new shop) and re-evaluates the decisions that can still change production. On
+# this chassis the only such decision after day 6 (the route branch) is the
+# finite tomato investment (V219): it is now committed by value, not by a shop
+# count. Value = projected tomato revenue of the 10 tiles (4 events per tile,
+# 2 units per event when fertilized) at prices that include our own added
+# supply, minus land, seeds, the dedicated hands and the fertilizer doses.
+# ---------------------------------------------------------------------------
+_EP_UNLOCK_DAYS = (3, 6, 9, 12, 15, 18, 21, 24)
+_EP_PARAMS = {
+    "tomato_tiles": 10,
+    "tomato_units_per_event": 2.0,  # the overlay fertilizes on days 24 and 27
+    "tomato_margin": 0.0,  # commit when value - cost > margin
+    "tomato_land": 4000.0,
+    "tomato_hand_days": 19.0,  # crop workers over days 18-28 (1 on six days, 2 on two, 3 on three)
+    "tomato_hand_cost": 190.0,  # fib(11..12): the extra hands come after the tape's own
+    "tomato_fertilizer_doses": 20.0,
+    "tomato_fixed_rule": False,  # True: the original rule (three tomato shops), for A/B
+}
+_EP_STATE = {}
+_EP_REPORT = {"epochs": 0, "tomato_value": [], "tomato_go": 0, "tomato_rule": 0}
+
+
+def _ep_update(obs):
+    player = int(obs["player"])
+    step = int(obs["step"])
+    st = _EP_STATE.get(player)
+    if st is None or step <= st["step"]:
+        st = _EP_STATE[player] = {"step": -1, "n_shops": 0, "epochs": []}
+    st["step"] = step
+    shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
+    if len(shops) > st["n_shops"]:
+        for shop in shops[st["n_shops"]:]:
+            st["epochs"].append((step // 24, shop))
+            _EP_REPORT["epochs"] += 1
+        st["n_shops"] = len(shops)
+    return st
+
+
+def _ep_tomato_value(obs):
+    """Projected revenue minus cost of the day-18 tomato investment, in dollars."""
+    p = _EP_PARAMS
+    farm = obs["farms"][int(obs["player"])]
+    per_day = p["tomato_tiles"] * p["tomato_units_per_event"]
+    extra = {d: {"TOMATO": per_day} for d in (26, 27, 28, 29)}
+    proj = _vs_projection(obs, extra_ours=extra)
+    revenue = 0.0
+    for d in (26, 27, 28, 29):
+        for i in range(int(per_day)):
+            revenue += proj.price("TOMATO", min(29, d + 1), i - per_day / 2.0)
+    cost = p["tomato_tiles"] * 50.0 + p["tomato_hand_days"] * p["tomato_hand_cost"]
+    if "SE" not in farm.get("unlocked_quadrants", []):
+        cost += p["tomato_land"]
+    cost += p["tomato_fertilizer_doses"] * float(obs["market"]["prices"].get("FERTILIZER", 100))
+    return revenue - cost
+
+
+def _ep_tomato_go(obs):
+    shops = obs["town"]["unlocked_shops"]
+    rule = sum(s in ("PIZZA_SHOP", "FARMERS_MARKET") for s in shops) >= 3
+    if rule:
+        _EP_REPORT["tomato_rule"] += 1
+    if _EP_PARAMS["tomato_fixed_rule"]:
+        return rule
+    try:
+        value = _ep_tomato_value(obs)
+    except Exception:
+        return rule
+    _EP_REPORT["tomato_value"].append(round(value))
+    go = value > _EP_PARAMS["tomato_margin"]
+    if go:
+        _EP_REPORT["tomato_go"] += 1
+    return go
+
+
+_EP_PARENT = agent
+del agent
+
+
+def agent(observation, configuration=None):
+    try:
+        _om_update(observation)
+        _ep_update(observation)
+    except Exception:
+        pass
+    return _EP_PARENT(observation, configuration)
+
+
+
+# ---------------------------------------------------------------------------
+# SW: adaptive planting on the tape's own tiles (the unlock-epoch decision that
+# can still change production). At the day-12 epoch, value converting k of the
+# tape's wheat tiles to tomatoes against the wheat they would grow, using the VS
+# projection with our added supply and the opponent's visible farm; buy the
+# seeds; rewrite only the tape's own visits to the chosen tiles (its wheat
+# replant becomes the tomato planting, replant attempts on a live tomato become
+# water/harvest, a dig on a spent plant is allowed); through the four yield days
+# one dedicated hand, hired after the tape's own hires, waters and harvests the
+# tiles (the tape's visits leave two-day gaps there). Tomatoes in the shed are
+# sold in lots capped at 5 % price impact. Tiles are chosen by observed watering
+# regularity, then shed distance. Everything is parametrised in _SW_PARAMS.
+# ---------------------------------------------------------------------------
+_SW_PARAMS = {
+    "enabled": True,
+    "epoch_day": 12,
+    "last_plant_day": 14,
+    "k_max": 8,
+    "margin": 0.0,
+    "seed_price": 50.0,
+    "wheat_units_per_tile_day": 1.2,
+    "wheat_last_day": 25,
+    "wheat_seed_per_day": 2.0,
+    "impact_cap": 0.95,
+    "candidates_extra": 4,
+    "fixed_k": None,
+    "track_from_day": 3,
+    "hand_hour": 7,
+    "hand_days_before": 1,
+    "hand_days_after": 0,
+    "hand_max_cost": 400.0,
+    "yield_efficiency": 1.0,
+}
+_SW_SHED = ((4, 4), (5, 4), (4, 5), (5, 5))
+_SW_STATE = {}
+_SW_REPORT = {"k": [], "values": [], "seeds": 0, "planted": 0, "digs": 0, "deaths": 0, "harvested": 0, "sold": 0, "revenue": 0.0, "errors": 0, "hand_days": 0, "hand_cost": 0.0}
+
+
+def _sw_fib(n):
+    a, b = 1, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+
+def _sw_dist(x, y):
+    return min(abs(x - a) + abs(y - b) for a, b in _SW_SHED)
+
+
+def _sw_walk(pos, target):
+    x, y = pos
+    tx, ty = target
+    if x != tx:
+        return ["EAST" if x < tx else "WEST"]
+    if y != ty:
+        return ["SOUTH" if y < ty else "NORTH"]
+    return None
+
+
+def _sw_state(player, step):
+    st = _SW_STATE.get(player)
+    if st is None or step <= st["step"]:
+        st = _SW_STATE[player] = {
+            "step": -1, "dry": {}, "seen": {}, "candidates": [], "k": 0, "decided": False,
+            "seeds_pending": False, "seeds_left": 0, "converted": {}, "spent": set(),
+            "hand": None, "hand_requested": None,
+        }
+    st["step"] = step
+    return st
+
+
+def _sw_footprint(player):
+    st = _SW_STATE.get(player)
+    if not st or not st["converted"]:
+        return {"active": False, "seeds": 0, "tiles": set()}
+    return {"active": True, "seeds": st["seeds_left"], "tiles": set(st["converted"])}
+
+
+def _sw_value(obs, farm, day, k):
+    p = _SW_PARAMS
+    first = day + 8
+    extra = {d: {"TOMATO": float(k)} for d in range(first, first + 4)}
+    proj = _vs_projection(obs, extra_ours=extra)
+    tomato = 0.0
+    for d in range(first, first + 4):
+        for i in range(k):
+            tomato += p["yield_efficiency"] * proj.price("TOMATO", min(29, d + 1), i - k / 2.0)
+    wheat_days = max(0, p["wheat_last_day"] - day)
+    wheat_price = proj.price("WHEAT", min(29, day + wheat_days // 2))
+    wheat = k * wheat_days * (p["wheat_units_per_tile_day"] * wheat_price - p["wheat_seed_per_day"])
+    hand_days = 4 + p["hand_days_before"] + p["hand_days_after"]
+    hand = hand_days * min(p["hand_max_cost"], _sw_fib(int(farm.get("hires_today", 0)) + 11))
+    return tomato - k * p["seed_price"] - wheat - hand
+
+
+def _sw_decide(obs, farm, st, day):
+    p = _SW_PARAMS
+    eligible = []
+    for y in range(10):
+        for x in range(10):
+            t = farm["tiles"][y][x]
+            if t == "LOCKED" or (x >= 5 and y >= 5):
+                continue
+            crops = st["seen"].get((x, y), set())
+            if crops & {"STRAWBERRY", "MELON"} or (isinstance(t, dict) and t.get("kind") != "PLANT"):
+                continue
+            if isinstance(t, dict) and t.get("crop") != "WHEAT":
+                continue
+            if t is None and "WHEAT" not in crops:
+                continue
+            eligible.append((st["dry"].get((x, y), 0), _sw_dist(x, y), (x, y)))
+    eligible.sort()
+    values = {}
+    best_k, best_v = 0, 0.0
+    for k in range(1, min(p["k_max"], len(eligible)) + 1):
+        values[k] = _sw_value(obs, farm, day, k)
+        if values[k] > best_v:
+            best_k, best_v = k, values[k]
+    if p["fixed_k"] is not None:
+        best_k = min(int(p["fixed_k"]), len(eligible))
+    elif best_v <= p["margin"]:
+        best_k = 0
+    st["k"] = best_k
+    st["candidates"] = [t for _, _, t in eligible[: best_k + p["candidates_extra"]]]
+    st["decided"] = True
+    st["seeds_pending"] = best_k > 0
+    _SW_REPORT["k"].append(best_k)
+    _SW_REPORT["values"].append({k: round(v) for k, v in values.items()})
+
+
+def _sw_hand_command(farm, pos, live):
+    todo = []
+    for xy in live:
+        t = farm["tiles"][xy[1]][xy[0]]
+        if not (isinstance(t, dict) and t.get("crop") == "TOMATO"):
+            continue
+        d = abs(pos[0] - xy[0]) + abs(pos[1] - xy[1])
+        if t.get("yield_units", 0) > 0:
+            todo.append((d, 0, xy, ["HARVEST"]))
+        elif not t.get("watered_today"):
+            todo.append((d, 1, xy, ["WATER"]))
+    if not todo:
+        return ["PASS"]
+    todo.sort()
+    _, _, xy, cmd = todo[0]
+    if cmd == ["HARVEST"] and pos == xy:
+        _SW_REPORT["harvested"] += farm["tiles"][xy[1]][xy[0]].get("yield_units", 0)
+    return _sw_walk(pos, xy) or cmd
+
+
+def _sw_apply(obs, action):
+    p = _SW_PARAMS
+    step = int(obs["step"])
+    day, hour = divmod(step, 24)
+    player = int(obs["player"])
+    farm = obs["farms"][player]
+    st = _sw_state(player, step)
+    if not p["enabled"] or not isinstance(action, dict):
+        return action
+    if hour == 23 and day >= p["track_from_day"]:
+        for y in range(10):
+            for x in range(10):
+                t = farm["tiles"][y][x]
+                if isinstance(t, dict) and t.get("kind") == "PLANT":
+                    st["seen"].setdefault((x, y), set()).add(t["crop"])
+                    if not t.get("watered_today"):
+                        st["dry"][(x, y)] = st["dry"].get((x, y), 0) + 1
+    market = [list(o) for o in (action.get("market") or []) if o]
+    changed = False
+    if not st["decided"] and day >= p["epoch_day"] and hour == 0:
+        _sw_decide(obs, farm, st, day)
+    if st["decided"] and st["seeds_pending"] and len(market) < 10:
+        market.append(["BUY_SEED", "TOMATO", int(st["k"])])
+        st["seeds_pending"] = False
+        st["seeds_left"] = st["k"]
+        _SW_REPORT["seeds"] += st["k"]
+        changed = True
+    if st["decided"] and st["k"] > 0 and not st["seeds_pending"]:
+        seeds = int((obs["private"].get("seeds") or {}).get("TOMATO", 0))
+        cmds = [action.get("farmer")] + list(action.get("hands") or [])
+        positions = [tuple(farm["farmer"])] + [tuple(h) for h in farm["hands"]]
+        new_cmds = list(cmds)
+        planted_now = 0
+        for i, c in enumerate(cmds):
+            if not c or i >= len(positions):
+                continue
+            xy = positions[i]
+            tile = farm["tiles"][xy[1]][xy[0]]
+            if xy in st["converted"] and xy not in st["spent"] and not (isinstance(tile, dict) and tile.get("crop") == "TOMATO"):
+                st["spent"].add(xy)
+                _SW_REPORT["deaths"] += 1
+            if c[0] == "PLANT" and tile is None and xy in st["candidates"] and xy not in st["converted"]:
+                if len(st["converted"]) < st["k"] and seeds - planted_now > 0 and day <= p["last_plant_day"]:
+                    new_cmds[i] = ["PLANT", "TOMATO"]
+                    st["converted"][xy] = day
+                    st["seeds_left"] = max(0, st["seeds_left"] - 1)
+                    planted_now += 1
+                    _SW_REPORT["planted"] += 1
+                    continue
+            if xy in st["converted"] and isinstance(tile, dict) and tile.get("crop") == "TOMATO" and c[0] in ("PLANT", "DIG"):
+                planted = st["converted"][xy]
+                if tile.get("yield_units", 0) <= 0 and day >= planted + 12:
+                    st["spent"].add(xy)
+                    _SW_REPORT["digs"] += 1
+                    if c[0] == "PLANT":
+                        new_cmds[i] = ["DIG"]
+                    continue
+                if not tile.get("watered_today"):
+                    new_cmds[i] = ["WATER"]
+                elif tile.get("yield_units", 0) > 0:
+                    new_cmds[i] = ["HARVEST"]
+                    _SW_REPORT["harvested"] += tile.get("yield_units", 0)
+                else:
+                    new_cmds[i] = ["PASS"]
+            elif xy in st["converted"] and isinstance(tile, dict) and tile.get("crop") == "TOMATO" and c[0] == "HARVEST":
+                _SW_REPORT["harvested"] += tile.get("yield_units", 0)
+        live = {xy: d0 for xy, d0 in st["converted"].items() if xy not in st["spent"]}
+        if live:
+            first_event = min(live.values()) + 8 - p["hand_days_before"]
+            last_event = max(live.values()) + 11 + p["hand_days_after"]
+            want = first_event <= day <= last_event and day <= 28
+            if want and hour == p["hand_hour"] and st["hand_requested"] != day and len(market) < 10:
+                cost = _sw_fib(int(farm.get("hires_today", 0)))
+                if cost <= p["hand_max_cost"] and farm["money"] > cost + 500:
+                    market.append(["HIRE"])
+                    st["hand_requested"] = day
+                    _SW_REPORT["hand_cost"] += cost
+                    changed = True
+            if st["hand_requested"] == day and hour > p["hand_hour"] and (st["hand"] is None or st["hand"][0] != day) and farm["hands"]:
+                st["hand"] = (day, len(farm["hands"]))
+                _SW_REPORT["hand_days"] += 1
+            if st["hand"] is not None and st["hand"][0] == day:
+                idx = st["hand"][1]
+                while len(new_cmds) <= idx:
+                    new_cmds.append(["PASS"])
+                if idx < len(positions):
+                    new_cmds[idx] = _sw_hand_command(farm, positions[idx], live)
+        if new_cmds != cmds:
+            action = dict(action)
+            action["farmer"] = new_cmds[0]
+            action["hands"] = new_cmds[1:]
+            changed = True
+        shed = obs["private"].get("shed") or {}
+        stock = int(shed.get("TOMATO", 0))
+        if stock > 0 and not any(o[0] == "SELL" and len(o) > 1 and o[1] == "TOMATO" for o in market) and len(market) < 10:
+            inv = int(obs["market"]["inventory"]["TOMATO"])
+            now = _r37_market_price("TOMATO", inv)
+            n = 0
+            while n < stock and _r37_market_price("TOMATO", inv + n) >= p["impact_cap"] * now:
+                n += 1
+            if n > 0:
+                market.append(["SELL", "TOMATO", n])
+                _SW_REPORT["sold"] += n
+                _SW_REPORT["revenue"] += n * now
+                changed = True
+    if changed:
+        action = dict(action)
+        action["market"] = market[:10]
+    return action
+
+
+_SW_PARENT = agent
+del agent
+
+
+def agent(observation, configuration=None):
+    action = _SW_PARENT(observation, configuration)
+    try:
+        action = _sw_apply(observation, action)
+    except Exception:  # noqa: BLE001 - the parent action is always a valid fallback
+        _SW_REPORT["errors"] += 1
+    return action
+
+
+
+# ---------------------------------------------------------------------------
+# CW: carrot wave. The one late-game production decision the top bots make and
+# the copies do not: when the town has drawn pet cafes (12 carrots a day each)
+# and farmers markets (6), carrots run to $90-150+ by days 25-29 while every
+# copy plants the same fixed 31. From the day-18 unlock (re-checked at 21 and
+# 24) the layer values converting the tape's wheat replants to carrots (2-3 day
+# cycle, 3 units unfertilized) at projected prices that include our own added
+# supply, and if it pays it buys seeds and rewrites only the tape's own visits
+# to those tiles: replant -> PLANT CARROT, visits at age 0-2 -> WATER, visits at
+# age >= 3 -> HARVEST (a carrot decays a unit every two steps from day+4, so
+# it is cut on the tape's first visit after age 3). Harvested carrots are held
+# and then sold in even lots from `sell_from_day`, the tape's own SELL CARROT
+# dumps capped to the same allowance. No extra land, no extra hands.
+# ---------------------------------------------------------------------------
+_CW_PARAMS = {
+    # Off by default: on our simulator's draws the wave loses $0.4-1.9k per game even with
+    # three cafes (the tape's visit cadence realises ~1.8 carrots per planting, they ripen
+    # into the two fixed day-25 carrot dumps and sell at ~$43, and the late wheat they
+    # displace is worth $75-130 a cycle). Kept as calibrated infrastructure; see notes.
+    "enabled": False,
+    "decision_days": (21, 24),
+    "last_plant_day": 26,
+    "batch": 10,  # plantings are valued in steps of this size
+    "max_plantings": 60,
+    "margin": 0.0,
+    "seed_price": 20.0,
+    "units_per_planting": 1.8,  # realised on the tape's visit cadence (measured 1.8-2.0)
+    "wheat_units_per_cycle": 4.5,
+    "own_wave_units": 31.0,
+    "wheat_seed": 10.0,
+    "lots_per_day": 6,  # a day's stock is cleared over the six shop ticks
+    "lot_every": 4,  # one lot per shop tick
+    "fixed_plantings": None,
+    "tiles": "strawberry",  # "strawberry": only tiles that held strawberries (cleared days 22-27, no feed wheat lost); "wheat": any wheat replant
+}
+_CW_STATE = {}
+_CW_REPORT = {"plantings_target": [], "values": [], "seeds": 0, "planted": 0, "harvested": 0, "sold": 0, "revenue": 0.0, "errors": 0, "capped": 0}
+
+
+def _cw_state(player, step):
+    st = _CW_STATE.get(player)
+    if st is None or step <= st["step"]:
+        st = _CW_STATE[player] = {"step": -1, "target": 0, "decided_days": set(), "seeds_pending": 0, "planted": 0, "tiles": {}, "harvested": 0}
+    st["step"] = step
+    return st
+
+
+def _cw_value(obs, farm, day, plantings):
+    p = _CW_PARAMS
+    units = p["units_per_planting"] * plantings
+    sell_days = [d for d in range(min(28, day + 4), 30)]
+    extra = {d: {"CARROT": units / len(sell_days)} for d in sell_days}
+    # the tape's own fixed carrot wave (planted day 25, sold days 27-29) is not on the farm
+    # yet when this is valued, so add it explicitly
+    # the same for a copy opponent's wave (its tiles are not planted until day 25 either)
+    waves = p["own_wave_units"] * (2 if _om_mode(int(obs["player"])) != "other" else 1)
+    for d, share in ((27, 0.2), (28, 0.4), (29, 0.4)):
+        extra.setdefault(d, {}).setdefault("CARROT", 0.0)
+        extra[d]["CARROT"] += waves * share
+    proj = _vs_projection(obs, extra_ours=extra)
+    revenue = 0.0
+    per_day = units / len(sell_days)
+    for d in sell_days:
+        for i in range(int(round(per_day))):
+            revenue += proj.price("CARROT", d, i - per_day / 2.0)
+    wheat_price = proj.price("WHEAT", min(29, day + 6))
+    wheat = plantings * (p["wheat_units_per_cycle"] * wheat_price - p["wheat_seed"])
+    return revenue - plantings * p["seed_price"] - wheat
+
+
+def _cw_decide(obs, farm, st, day):
+    p = _CW_PARAMS
+    values = {}
+    best_k, best_v = 0, 0.0
+    for k in range(p["batch"], p["max_plantings"] + 1, p["batch"]):
+        values[k] = _cw_value(obs, farm, day, k)
+        if values[k] > best_v:
+            best_k, best_v = k, values[k]
+    if p["fixed_plantings"] is not None:
+        best_k = int(p["fixed_plantings"])
+    elif best_v <= p["margin"]:
+        best_k = 0
+    if best_k > st["target"]:
+        st["seeds_pending"] += best_k - st["target"]
+        st["target"] = best_k
+    _CW_REPORT["plantings_target"].append(best_k)
+    _CW_REPORT["values"].append({k: round(v) for k, v in values.items()})
+
+
+def _cw_apply(obs, action):
+    p = _CW_PARAMS
+    step = int(obs["step"])
+    day, hour = divmod(step, 24)
+    player = int(obs["player"])
+    farm = obs["farms"][player]
+    st = _cw_state(player, step)
+    if not p["enabled"] or not isinstance(action, dict) or day < min(p["decision_days"]):
+        return action
+    market = [list(o) for o in (action.get("market") or []) if o]
+    changed = False
+    if day in p["decision_days"] and hour == 0 and day not in st["decided_days"]:
+        st["decided_days"].add(day)
+        _cw_decide(obs, farm, st, day)
+    if st["seeds_pending"] > 0 and len(market) < 10 and day <= p["last_plant_day"]:
+        market.append(["BUY_SEED", "CARROT", int(st["seeds_pending"])])
+        _CW_REPORT["seeds"] += st["seeds_pending"]
+        st["seeds_pending"] = 0
+        changed = True
+    if st["target"] > 0:
+        seeds = int((obs["private"].get("seeds") or {}).get("CARROT", 0))
+        cmds = [action.get("farmer")] + list(action.get("hands") or [])
+        positions = [tuple(farm["farmer"])] + [tuple(h) for h in farm["hands"]]
+        new_cmds = list(cmds)
+        planted_now = 0
+        for i, c in enumerate(cmds):
+            if not c or i >= len(positions):
+                continue
+            xy = positions[i]
+            tile = farm["tiles"][xy[1]][xy[0]]
+            sw_tiles = _SW_STATE.get(player, {}).get("converted", {}) if _SW_STATE.get(player) else {}
+            if xy in sw_tiles or (xy[0] >= 5 and xy[1] >= 5):
+                continue  # the SW tomato tiles and the SE tomato overlay are not ours
+            if c[0] == "PLANT" and len(c) > 1 and c[1] == "WHEAT" and tile is None:
+                seen = (_SW_STATE.get(player) or {}).get("seen", {}).get(xy, set())
+                if p["tiles"] == "strawberry" and "STRAWBERRY" not in seen:
+                    continue
+                if st["planted"] < st["target"] and seeds - planted_now > 0 and day <= p["last_plant_day"]:
+                    new_cmds[i] = ["PLANT", "CARROT"]
+                    st["tiles"][xy] = day
+                    st["planted"] += 1
+                    planted_now += 1
+                    _CW_REPORT["planted"] += 1
+                continue
+            if xy in st["tiles"] and isinstance(tile, dict) and tile.get("crop") == "CARROT" and c[0] in ("PLANT", "DIG", "WATER", "HARVEST", "FERTILIZE"):
+                age = day - tile.get("planted_day", st["tiles"][xy])
+                yield_units = tile.get("yield_units", 0)
+                if age >= 3 and yield_units > 0:
+                    new_cmds[i] = ["HARVEST"]
+                    _CW_REPORT["harvested"] += yield_units
+                    st["harvested"] += yield_units
+                elif age >= 3:
+                    new_cmds[i] = ["DIG"] if c[0] in ("PLANT", "DIG") else ["PASS"]
+                elif not tile.get("watered_today"):
+                    new_cmds[i] = ["WATER"]
+                elif c[0] == "FERTILIZE":
+                    pass  # the tape's own dose on our carrot: keep it
+                else:
+                    new_cmds[i] = ["PASS"]
+            elif xy in st["tiles"] and not (isinstance(tile, dict) and tile.get("crop") == "CARROT"):
+                st["tiles"].pop(xy, None)  # harvested or gone: the tile is the tape's again
+        if new_cmds != cmds:
+            action = dict(action)
+            action["farmer"] = new_cmds[0]
+            action["hands"] = new_cmds[1:]
+            changed = True
+        # selling: the shed holds 100 units and the tape trades wheat through it, so carrots
+        # are not held: each shop tick sells a lot that clears the stock within a day
+        shed = obs["private"].get("shed") or {}
+        stock = int(shed.get("CARROT", 0))
+        allowance = 0
+        if stock > 0 and st["harvested"] > 0:
+            allowance = max(1, -(-stock // p["lots_per_day"])) if step % p["lot_every"] == 0 else 0
+            if step >= 712:
+                allowance = stock
+        kept = []
+        had_sell = False
+        for o in market:
+            if o[0] == "SELL" and len(o) >= 3 and o[1] == "CARROT":
+                had_sell = True
+                if allowance > 0:
+                    if int(o[2]) > allowance:
+                        _CW_REPORT["capped"] += 1
+                    kept.append(["SELL", "CARROT", min(int(o[2]), allowance)])
+                else:
+                    _CW_REPORT["capped"] += 1
+                changed = True
+            else:
+                kept.append(o)
+        market = kept
+        if allowance > 0 and not had_sell and len(market) < 10:
+            market.append(["SELL", "CARROT", allowance])
+            changed = True
+        if allowance > 0:
+            _CW_REPORT["sold"] += allowance
+            _CW_REPORT["revenue"] += allowance * _r37_market_price("CARROT", int(obs["market"]["inventory"]["CARROT"]))
+    if changed:
+        action = dict(action)
+        action["market"] = market[:10]
+    return action
+
+
+_CW_PARENT = agent
+del agent
+
+
+def agent(observation, configuration=None):
+    action = _CW_PARENT(observation, configuration)
+    try:
+        action = _cw_apply(observation, action)
+    except Exception:  # noqa: BLE001 - the parent action is always a valid fallback
+        _CW_REPORT["errors"] += 1
     return action
