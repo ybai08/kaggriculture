@@ -4290,3 +4290,33 @@ def agent(observation, configuration=None):
     except Exception:  # noqa: BLE001 - the parent action is always a valid fallback
         _CW_REPORT["errors"] += 1
     return action
+
+
+
+# ---------------------------------------------------------------------------
+# RT (after Ahmed Berat Ozer's V45 / EXP286): a large first-turn wheat
+# round trip, one BUY order then one SELL order of the same size, ahead of the
+# opening's feed purchase. Neutral against the market; against the public route
+# tape family, whose turn-0 opening is [BUY 5, BUY 10, SELL 60], the shared
+# per-unit quoting makes their second buy cost ~$60 more, which their strictly
+# funded day-0 plan cannot absorb (one melon fewer).
+# Size: paired sweep 20/25/30/35/40/45/70 vs four live openings. 70 (V45's size) costs the
+# public-tape copy a melon (+$1,281) but loses one to sell-first openings (-$1,340) and
+# is neutral vs other round-trippers; 30-40 is a plateau that keeps the +$22k against the
+# 13/30/30 family, limits the sell-first loss to -$222..-$245, beats round-trippers by
+# +$1.5k and gives up the copy's melon (+$180). 35 chosen (middle of the plateau).
+# ---------------------------------------------------------------------------
+_RT_UNITS = 35
+_RT_PARENT = agent
+del agent
+
+
+def agent(observation, configuration=None):
+    action = _RT_PARENT(observation, configuration)
+    try:
+        if int(observation["step"]) == 0 and isinstance(action, dict):
+            market = [list(o) for o in (action.get("market") or []) if o]
+            action = dict(action, market=([["BUY_PRODUCT", "WHEAT", _RT_UNITS], ["SELL", "WHEAT", _RT_UNITS]] + market)[:10])
+    except Exception:  # noqa: BLE001
+        pass
+    return action
