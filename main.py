@@ -4320,3 +4320,233 @@ def agent(observation, configuration=None):
     except Exception:  # noqa: BLE001
         pass
     return action
+
+
+
+# ---------------------------------------------------------------------------
+# OV: evening overflow sale. At the end of the day the hands' inventories are
+# dropped into the shed and anything beyond 100 units is discarded (~10 units,
+# ~$470 a game: wheat, fertilizer, strawberries). At hour 23 the layer projects
+# the drop (shed + carried, minus what the tape's own orders sell this step) and
+# sells the excess from the shed, cheapest product first.
+# ---------------------------------------------------------------------------
+_OV_PARAMS = {"enabled": True, "hour": 23, "margin": 2}
+_OV_REPORT = {"sold": 0, "revenue": 0.0, "errors": 0}
+
+
+def _ov_apply(obs, action):
+    p = _OV_PARAMS
+    step = int(obs["step"])
+    hour = step % 24
+    if not p["enabled"] or hour != p["hour"] or not isinstance(action, dict):
+        return action
+    player = int(obs["player"])
+    shed = dict(obs["private"].get("shed") or {})
+    carried = {}
+    for inv in obs["private"].get("inventories") or []:
+        for k, v in inv.items():
+            if k in _VS_PRODUCTS:
+                carried[k] = carried.get(k, 0) + v
+    market = [list(o) for o in (action.get("market") or []) if o]
+    planned = {}
+    for o in market:
+        if o[0] == "SELL" and len(o) >= 3 and o[1] in _VS_PRODUCTS:
+            planned[o[1]] = planned.get(o[1], 0) + min(int(o[2]), shed.get(o[1], 0))
+    # units the hands will harvest this very step land in their inventories before the drop
+    farm = obs["farms"][player]
+    positions = [tuple(farm["farmer"])] + [tuple(h) for h in farm["hands"]]
+    harvest_units = 0
+    for i, c in enumerate([action.get("farmer")] + list(action.get("hands") or [])):
+        if c and c[0] == "HARVEST" and i < len(positions):
+            t = farm["tiles"][positions[i][1]][positions[i][0]]
+            if isinstance(t, dict):
+                harvest_units += int(t.get("yield_units", 0))
+    load = sum(v for k, v in shed.items() if k in _VS_PRODUCTS) - sum(planned.values()) + sum(carried.values()) + harvest_units
+    excess = load - 100 + p["margin"]
+    if excess <= 0:
+        return action
+    prices = obs["market"]["prices"]
+    avail = sorted(((prices.get(k, 0), k, shed.get(k, 0) - planned.get(k, 0)) for k in _VS_PRODUCTS if shed.get(k, 0) - planned.get(k, 0) > 0))
+    for price, item, n in avail:
+        if excess <= 0 or len(market) >= 10:
+            break
+        q = min(n, excess)
+        if any(o[0] == "SELL" and len(o) >= 3 and o[1] == item for o in market):
+            for o in market:
+                if o[0] == "SELL" and len(o) >= 3 and o[1] == item:
+                    o[2] = int(o[2]) + q
+                    break
+        else:
+            market.append(["SELL", item, q])
+        excess -= q
+        _OV_REPORT["sold"] += q
+        _OV_REPORT["revenue"] += q * price
+    return dict(action, market=market[:10])
+
+
+_OV_PARENT = agent
+del agent
+
+
+def agent(observation, configuration=None):
+    action = _OV_PARENT(observation, configuration)
+    try:
+        action = _ov_apply(observation, action)
+    except Exception:  # noqa: BLE001
+        _OV_REPORT["errors"] += 1
+    return action
+
+
+# ---------------------------------------------------------------------------
+# IH: idle-hand utility. The tape's hands finish their routes early in the
+# evening (~450 idle unit-steps a game in hours 16-23) while fertilizer is left
+# on animals overnight (~29 units a game lost at the refresh) and wheat tiles sit
+# empty between harvest and replant. A hand whose remaining tape commands for
+# the day are all PASS is route-free; such hands are given the nearest of:
+# collect fertilizer, plant wheat on an empty tile that has only ever held
+# wheat (and water it the same evening, or it dies), water an unspent plant
+# that was dry yesterday. Nothing on a tile the tape uses for another crop.
+# ---------------------------------------------------------------------------
+_IH_PARAMS = {"enabled": True, "from_day": 6, "collect": True, "plant": False, "water": False, "min_hours_left": 2, "seed_batch": 6}
+_IH_STATE = {}
+_IH_REPORT = {"collected": 0, "planted": 0, "watered": 0, "moves": 0, "seeds": 0, "errors": 0}
+
+
+def _ih_state(player, step):
+    st = _IH_STATE.get(player)
+    if st is None or step <= st["step"]:
+        st = _IH_STATE[player] = {"step": -1, "seen": {}, "jobs": {}, "day": -1, "seeds_pending": False}
+    st["step"] = step
+    return st
+
+
+def _ih_free(route, step, idx):
+    tape = _IMPL.chassis.routes.get(route) or []
+    day_end = (step // 24 + 1) * 24
+    for s in range(step, min(day_end, len(tape))):
+        hands = tape[s].get("hands") or []
+        if idx - 1 < len(hands) and hands[idx - 1] not in (None, ["PASS"]):
+            return False
+    return True
+
+
+def _ih_apply(obs, action):
+    p = _IH_PARAMS
+    step = int(obs["step"])
+    day, hour = divmod(step, 24)
+    player = int(obs["player"])
+    farm = obs["farms"][player]
+    st = _ih_state(player, step)
+    if not p["enabled"] or day < p["from_day"] or not isinstance(action, dict):
+        return action
+    tiles = farm["tiles"]
+    if hour == 23:
+        for y in range(10):
+            for x in range(10):
+                t = tiles[y][x]
+                if isinstance(t, dict) and t.get("kind") == "PLANT":
+                    st["seen"].setdefault((x, y), set()).add(t["crop"])
+    if st["day"] != day:
+        st["day"] = day
+        st["jobs"] = {}
+    cmds = [action.get("farmer")] + list(action.get("hands") or [])
+    positions = [tuple(farm["farmer"])] + [tuple(h) for h in farm["hands"]]
+    if 23 - hour < p["min_hours_left"]:
+        return action
+    state = _IMPL.chassis.players.get(player) if isinstance(_IMPL.chassis.players, dict) else None
+    route = state.get("route", 0) if isinstance(state, dict) else 0
+    seeds = int((obs["private"].get("seeds") or {}).get("WHEAT", 0))
+    market = [list(o) for o in (action.get("market") or []) if o]
+    new_cmds = list(cmds)
+    taken = set(st["jobs"].values())
+    changed = False
+    free = [i for i in range(1, min(len(cmds), len(positions))) if (not cmds[i] or cmds[i] == ["PASS"]) and _ih_free(route, step, i)]
+    for i in free:
+        pos = positions[i]
+        job = st["jobs"].get(i)
+        if job is not None:
+            xy, kind = job
+            t = tiles[xy[1]][xy[0]]
+            done = (kind == "collect" and not (isinstance(t, dict) and t.get("fertilizer_available"))) or \
+                   (kind == "plant" and isinstance(t, dict) and t.get("kind") == "PLANT" and t.get("watered_today")) or \
+                   (kind == "water" and isinstance(t, dict) and t.get("watered_today")) or t == "LOCKED"
+            if done:
+                st["jobs"].pop(i, None)
+                job = None
+        if job is None:
+            options = []
+            for y in range(10):
+                for x in range(10):
+                    if (x, y) in taken:
+                        continue
+                    t = tiles[y][x]
+                    d = abs(pos[0] - x) + abs(pos[1] - y)
+                    if d + 1 > 23 - hour:
+                        continue
+                    if p["collect"] and isinstance(t, dict) and "animal" in t and t.get("fertilizer_available"):
+                        options.append((1, d, (x, y), "collect"))
+                    elif p["plant"] and t is None and seeds > 0 and st["seen"].get((x, y)) == {"WHEAT"} and d + 2 <= 23 - hour and day <= 25:
+                        options.append((2, d, (x, y), "plant"))
+                    elif p["water"] and isinstance(t, dict) and t.get("kind") == "PLANT" and not t.get("watered_today") and t.get("consecutive_unwatered", 0) >= 1:
+                        crop = _VS_CROPS[t["crop"]]
+                        age = day - t.get("planted_day", day)
+                        spent = crop["ongoing"] and age >= crop["first_yield_day"] + crop["interval"] * (crop["max_yield"] - 1)
+                        if not spent:
+                            options.append((0, d, (x, y), "water"))
+            if not options:
+                continue
+            options.sort()
+            _, _, xy, kind = options[0]
+            st["jobs"][i] = (xy, kind)
+            taken.add(xy)
+            job = (xy, kind)
+        xy, kind = job
+        if pos != xy:
+            new_cmds[i] = _sw_walk(pos, xy)
+            _IH_REPORT["moves"] += 1
+        else:
+            t = tiles[xy[1]][xy[0]]
+            if kind == "collect":
+                new_cmds[i] = ["COLLECT_FERTILIZER"]
+                _IH_REPORT["collected"] += 1
+            elif kind == "plant":
+                if t is None and seeds > 0:
+                    new_cmds[i] = ["PLANT", "WHEAT"]
+                    seeds -= 1
+                    _IH_REPORT["planted"] += 1
+                elif isinstance(t, dict) and not t.get("watered_today"):
+                    new_cmds[i] = ["WATER"]
+                    _IH_REPORT["watered"] += 1
+                else:
+                    st["jobs"].pop(i, None)
+                    continue
+            elif kind == "water":
+                new_cmds[i] = ["WATER"]
+                _IH_REPORT["watered"] += 1
+        changed = True
+    if p["plant"] and seeds < 2 and hour <= 12 and day <= 25 and len(market) < 10 and not any(o[0] == "BUY_SEED" and o[1] == "WHEAT" for o in market):
+        market.append(["BUY_SEED", "WHEAT", p["seed_batch"]])
+        _IH_REPORT["seeds"] += p["seed_batch"]
+        changed = True
+    if changed:
+        action = dict(action)
+        action["farmer"] = new_cmds[0]
+        action["hands"] = new_cmds[1:]
+        action["market"] = market[:10]
+    return action
+
+
+_IH_PARENT = agent
+del agent
+
+
+def agent(observation, configuration=None):
+    action = _IH_PARENT(observation, configuration)
+    try:
+        action = _ih_apply(observation, action)
+    except Exception:  # noqa: BLE001
+        _IH_REPORT["errors"] += 1
+    return action
+
+
+_IMPL.chassis.cfg["min_sell_price"] = 10
