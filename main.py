@@ -3617,6 +3617,12 @@ def _vs_projection(obs, extra_ours=None):
     return _VsProjection(inv, day, used, theirs, ours)
 
 
+
+_DF_STATE = {}
+def _df_margin(player, item, default):
+    st = _DF_STATE.get(int(player)) or {}
+    return 0.0 if (st.get("dumper") or {}).get(item) else default
+
 def _vs_adjust(obs, action):
     p = _VS_PARAMS
     step = int(obs["step"])
@@ -3648,13 +3654,24 @@ def _vs_adjust(obs, action):
             market = [o for o in market if not (o[0] == "SELL" and len(o) >= 3 and o[1] == item)]
             _VS_STATS["held"] += planned
             changed = True
-        elif planned == 0 and stock >= 3 and now > best * (1 + p["sell_margin"]) and len(market) < 10:
-            n = 0
-            while n < stock and _r37_market_price(item, inv.get(item, 10000) + n) >= p["impact_cap"] * now:
+        elif (planned == 0 and stock >= 3 or 0 < planned < stock) and now > best * (1 + _df_margin(player, item, p["sell_margin"])) and (planned > 0 or len(market) < 10):
+            n = planned
+            while n < stock and _r37_market_price(item, inv.get(item, 10000) + n) >= max(best * (1 + _df_margin(player, item, p["sell_margin"])), 0.6 * now):
                 n += 1
-            if n >= 1:
-                market.append(["SELL", item, n])
-                _VS_STATS["added"] += n
+            if n > planned:
+                _prices = obs["market"]["prices"]
+                _at_risk = sum(int(o[2]) * int(_prices.get(o[1], 0)) for o in market if o[0] == "SELL" and len(o) >= 3 and o[1] in p["products"] and o[1] != item)
+                if planned > 0:
+                    # top up the chassis's own order in place (keeps every index aligned)
+                    idx = next(i for i, o in enumerate(market) if o[0] == "SELL" and len(o) >= 3 and o[1] == item)
+                    market[idx] = ["SELL", item, int(market[idx][2]) + n - planned]
+                    if False and idx > 0 and n * now > _at_risk:
+                        market.insert(0, market.pop(idx))
+                elif n * now > _at_risk:
+                    market.insert(0, ["SELL", item, n])
+                else:
+                    market.append(["SELL", item, n])
+                _VS_STATS["added"] += n - planned
                 changed = True
     if changed:
         action = dict(action)
@@ -4550,3 +4567,113 @@ def agent(observation, configuration=None):
 
 
 _IMPL.chassis.cfg["min_sell_price"] = 10
+
+# ---- layer DF: day-start dumper front-run ---------------------------------------
+# Opponent sales per step of sell-only products are recovered from the market inventory:
+# inv[t] = inv[t-1] + sold_both(t-1) - consumption(t-1). An opponent that sells >= _DF_LOT
+# units of an item at hour 0-1 on >= _DF_DAYS days is a day-start dumper for that item; from
+# then on we sell our stock of it at hour 23, at index 0, down to the price their lot will
+# leave tomorrow (but never below _DF_FLOOR x now).
+_DF_PARENT = agent
+del agent
+_DF_SHOPS = {
+    "BAKERY":         ["EGG", "WHEAT"],
+    "PIZZA_SHOP":     ["MILK", "TOMATO", "WHEAT"],
+    "BRUNCH_SPOT":    ["EGG", "WHEAT", "STRAWBERRY"],
+    "YARN_STORE":     ["WOOL"],
+    "ICE_CREAM_SHOP": ["STRAWBERRY", "MILK", "WHEAT"],
+    "PET_CAFE":       ["CARROT"],
+    "SMOOTHIE_SHOP":  ["STRAWBERRY", "MILK"],
+    "FARMERS_MARKET": ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY"],
+}
+_DF_ITEMS = ("MILK", "WOOL", "STRAWBERRY", "EGG")
+_DF_LOT = 8
+_DF_DAYS = 2
+_DF_FLOOR = 0.5
+_DF_STATS = {"dumper_flags": 0, "front_run_units": 0, "errors": 0}
+
+def _df_consumption(shops, step):
+    used = {i: 0 for i in _DF_ITEMS}
+    if step % 4 == 0:
+        for name in shops:
+            products = _DF_SHOPS.get(name) or []
+            mult = 2 if len(products) == 1 else 1
+            for i in products:
+                if i in used:
+                    used[i] += mult
+    if step % 24 == 0:
+        for i in used:
+            used[i] += 1
+    return used
+
+def _df_track(obs, st):
+    step = int(obs["step"])
+    inv = {i: int(obs["market"]["inventory"][i]) for i in _DF_ITEMS}
+    prev = st.get("inv")
+    if prev is not None and st.get("step") == step - 1:
+        shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
+        used = _df_consumption(shops, step - 1)
+        ours = st.get("ours") or {}
+        for i in _DF_ITEMS:
+            theirs = inv[i] - prev[i] + used[i] - ours.get(i, 0)
+            hour = (step - 1) % 24
+            if theirs >= _DF_LOT and hour <= 1:
+                days = st.setdefault("early", {}).setdefault(i, {})
+                days[(step - 1) // 24] = max(days.get((step - 1) // 24, 0), theirs)
+                if len(days) >= _DF_DAYS and i not in st.setdefault("dumper", {}):
+                    st["dumper"][i] = True
+                    _DF_STATS["dumper_flags"] += 1
+    st["inv"] = inv
+    st["step"] = step
+
+def _df_record_ours(obs, action, st):
+    shed = obs["private"].get("shed") or {}
+    ours = {}
+    for o in action.get("market") or []:
+        if o and o[0] == "SELL" and len(o) > 2 and o[1] in _DF_ITEMS:
+            ours[o[1]] = ours.get(o[1], 0) + int(o[2])
+    st["ours"] = {i: min(q, int(shed.get(i, 0))) for i, q in ours.items()}
+
+def _df_front_run(obs, action, st):
+    step = int(obs["step"])
+    return action
+    shed = obs["private"].get("shed") or {}
+    inv = obs["market"]["inventory"]
+    market = [list(o) for o in (action.get("market") or []) if o]
+    changed = False
+    for item in _DF_ITEMS:
+        if not st["dumper"].get(item):
+            continue
+        stock = int(shed.get(item, 0))
+        if stock <= 0 or len(market) >= 10:
+            continue
+        planned = sum(int(o[2]) for o in market if o[0] == "SELL" and len(o) > 2 and o[1] == item)
+        stock -= planned
+        if stock <= 0:
+            continue
+        lot = max(st["early"][item].values())
+        now = _r37_market_price(item, int(inv[item]))
+        after = _r37_market_price(item, int(inv[item]) + lot + planned)
+        target = max(after * 1.05, _DF_FLOOR * now)
+        n = 0
+        while n < stock and _r37_market_price(item, int(inv[item]) + planned + n) >= target:
+            n += 1
+        if n >= 1:
+            market.insert(0, ["SELL", item, n])
+            _DF_STATS["front_run_units"] += n
+            changed = True
+    if changed:
+        action = dict(action)
+        action["market"] = market[:10]
+    return action
+
+def agent(observation, configuration=None):
+    action = _DF_PARENT(observation, configuration)
+    try:
+        st = _DF_STATE.setdefault(int(observation["player"]), {})
+        _df_track(observation, st)
+        action = _df_front_run(observation, action, st)
+        _df_record_ours(observation, action, st)
+    except Exception:  # noqa: BLE001
+        _DF_STATS["errors"] += 1
+    return action
