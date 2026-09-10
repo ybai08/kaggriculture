@@ -35,6 +35,10 @@
 #      OM  opponent mode: layout-similarity streak -> "copy" / "other"; gates F1.
 #      EP  unlock epochs: records each shop draw; value gate for V219.
 #      RT  turn-0 wheat round trip (35 units) ahead of the feed purchase.
+#      TS  timing simulation: sell ready stock now when a same-day simulation on
+#          the price curve (rival's hourly pattern from yesterday) beats the tape's
+#          slots by >= $200; then
+#      FL  front-load: sales first in the market list (index is race priority).
 #      OV  overflow sale of units the end-of-day drop would discard, in three
 #          passes (hours 21, 22, 23): the early passes sell the projected excess
 #          ahead of same-lineage rivals' evening lots, the last one mops up.
@@ -4159,6 +4163,242 @@ def agent(observation, configuration=None):
 
 
 _IMPL.chassis.cfg["min_sell_price"] = 10
+
+
+_TS_SHOPS = {
+    "BAKERY":         ["EGG", "WHEAT"],
+    "PIZZA_SHOP":     ["MILK", "TOMATO", "WHEAT"],
+    "BRUNCH_SPOT":    ["EGG", "WHEAT", "STRAWBERRY"],
+    "YARN_STORE":     ["WOOL"],
+    "ICE_CREAM_SHOP": ["STRAWBERRY", "MILK", "WHEAT"],
+    "PET_CAFE":       ["CARROT"],
+    "SMOOTHIE_SHOP":  ["STRAWBERRY", "MILK"],
+    "FARMERS_MARKET": ["WHEAT", "CARROT", "TOMATO", "STRAWBERRY"],
+}
+_TS_ITEMS_ALL = ("MILK", "WOOL", "STRAWBERRY", "EGG")
+_DF_LOT = 8
+_DF_DAYS = 2
+_DF_STATS = {"dumper_flags": 0, "errors": 0}
+
+def _ts_consumption(shops, step):
+    """Town consumption of _TS_ITEMS_ALL applied after the market at `step`."""
+    used = {i: 0 for i in _TS_ITEMS_ALL}
+    if step % 4 == 0:
+        for name in shops:
+            products = _TS_SHOPS.get(name) or []
+            mult = 2 if len(products) == 1 else 1
+            for i in products:
+                if i in used:
+                    used[i] += mult
+    if step % 24 == 0:
+        for i in used:
+            used[i] += 1
+    return used
+
+
+
+# ---------------------------------------------------------------------------
+# TS: timing simulation. Each turn, for every crash-prone product with ready
+# stock in the shed that the tape sells later today, simulate the day on the
+# engine's own price curve twice: sell the stock now, or leave it for the
+# tape's slots. The only unknown is the rival's selling by hour, taken from
+# what it did yesterday (market-inventory deltas net of our own sales and the
+# town's consumption). Sell now when that pays by more than the margin. Against
+# a same-tape copy the later slots win (the price recovers between its lots);
+# against a file that unloads at dawn (V46/V47 EXP293) selling into the same
+# turn wins. Nothing here names an opponent or an hour.
+# ---------------------------------------------------------------------------
+_TS_PARENT = agent
+del agent
+_TS_PARAMS = {'margin': 10, 'from_step': 144, 'cap': 60, 'interleave': 1, 'min_gain': 200, 'items': ('STRAWBERRY', 'MILK', 'WOOL', 'EGG')}
+_TS_STATE = {}
+_TS_STATS = {"turns": 0, "units": 0, "errors": 0}
+
+
+def _ts_future(player, t):
+    native = _IMPL.chassis.players[player]
+    return _IMPL.chassis.routes[2 if t >= 648 else native["route"]][t].get("market", []) or []
+
+
+def _ts_track(obs, st):
+    """Rival sales per item per step from the inventory deltas (DF's identity)."""
+    step = int(obs["step"])
+    items = _TS_PARAMS["items"]
+    inv = {i: int(obs["market"]["inventory"][i]) for i in items}
+    prev = st.get("inv")
+    if prev is not None and st.get("step") == step - 1:
+        shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
+        used = _ts_consumption(shops, step - 1)
+        ours = st.get("ours") or {}
+        theirs = st.setdefault("theirs", {})
+        for i in items:
+            n = inv[i] - prev[i] + used.get(i, 0) - ours.get(i, 0)
+            theirs[(step - 1, i)] = max(0, n)
+    st["inv"] = inv
+    st["step"] = step
+
+
+def _ts_record_ours(obs, action, st):
+    shed = obs["private"].get("shed") or {}
+    ours = {}
+    for o in action.get("market") or []:
+        if o and o[0] == "SELL" and len(o) > 2 and o[1] in _TS_PARAMS["items"]:
+            ours[o[1]] = ours.get(o[1], 0) + int(o[2])
+    st["ours"] = {i: min(q, int(shed.get(i, 0))) for i, q in ours.items()}
+
+
+def _ts_simulate(obs, st, item, stock, slots, step):
+    """(revenue if sold now, revenue if left for the slots) for `stock` units of `item`."""
+    p = _TS_PARAMS
+    shops = list((obs.get("town") or {}).get("unlocked_shops") or [])
+    theirs = st.get("theirs") or {}
+    inv0 = int(obs["market"]["inventory"][item])
+    day = step // 24
+
+    def rival(t):
+        return theirs.get((t - 24, item), 0)  # yesterday at the same hour
+
+    # sell now: our units interleave with the rival's units of this turn
+    r_now = rival(step) if p["interleave"] else 0
+    now = 0
+    for k in range(stock):
+        now += _r37_market_price(item, inv0 + k + min(k, r_now))
+    # wait: the market moves through the day, then our units go at the tape's slots
+    inv = inv0 + r_now - _ts_consumption(shops, step).get(item, 0)
+    left = stock
+    wait = 0
+    for t in range(step + 1, (day + 1) * 24):
+        if t > 718:
+            break
+        r_t = rival(t)
+        q = 0
+        for hour_t, qty in slots:
+            if hour_t == t:
+                q += qty
+        q = min(q, left)
+        for k in range(q):
+            wait += _r37_market_price(item, inv + k + (min(k, r_t) if p["interleave"] else 0))
+        left -= q
+        inv += q + r_t - _ts_consumption(shops, t).get(item, 0)
+    # units the slots do not cover today stay in the shed: value them at the closing price
+    if left > 0:
+        wait += left * _r37_market_price(item, inv)
+    return now, wait
+
+
+def _ts_apply(obs, action, st):
+    p = _TS_PARAMS
+    step = int(obs["step"])
+    player = int(obs["player"])
+    day, hour = divmod(step, 24)
+    if step < p["from_step"] or hour == 23 or step >= 718:
+        return action
+    market = [list(o) for o in (action.get("market") or [])]
+    if any(len(o) > 1 and o[0] == "BUY_PRODUCT" for o in market):
+        return action
+    stock = projected_shed(action, FarmView(obs))
+    selling = {}
+    for o in market:
+        if len(o) >= 3 and o[0] == "SELL":
+            selling[o[1]] = selling.get(o[1], 0) + max(0, int(o[2]))
+    commands = [action.get("farmer") or ["PASS"], *(action.get("hands") or [])]
+    picked = {c[1] for c in commands if len(c) > 1 and c[0] == "PICKUP"}
+    extra = []
+    added = 0
+    for item in p["items"]:
+        if item in picked:
+            continue
+        avail = int(stock.get(item, 0)) - selling.get(item, 0)
+        if avail < 1:
+            continue
+        avail = min(avail, p["cap"])
+        slots = []
+        for t in range(step + 1, (day + 1) * 24):
+            if t > 718:
+                break
+            for o in _ts_future(player, t):
+                if o and len(o) >= 3 and o[0] == "SELL" and o[1] == item:
+                    try:
+                        slots.append((t, max(0, int(o[2]))))
+                    except Exception:
+                        pass
+        if not slots:
+            continue
+        now, wait = _ts_simulate(obs, st, item, avail, slots, step)
+        if now > wait * (1.0 + p["margin"] / 100.0) and now - wait >= p["min_gain"]:
+            hit = next((o for o in market if len(o) >= 3 and o[0] == "SELL" and o[1] == item), None)
+            if hit is not None:
+                hit[2] = int(hit[2]) + avail
+            elif len(market) + len(extra) < 10:
+                extra.append(["SELL", item, avail])
+            else:
+                continue
+            added += avail
+    if not added:
+        return action
+    _TS_STATS["turns"] += 1
+    _TS_STATS["units"] += added
+    return dict(action, market=extra + market)
+
+
+def agent(observation, configuration=None):
+    action = _TS_PARENT(observation, configuration)
+    try:
+        st = _TS_STATE.setdefault(int(observation["player"]), {})
+        if int(observation["step"]) == 0:
+            st.clear()
+        _ts_track(observation, st)
+        action = _ts_apply(observation, action, st)
+        _ts_record_ours(observation, action, st)
+    except Exception:  # noqa: BLE001
+        _TS_STATS["errors"] += 1
+    return action
+
+
+# ---------------------------------------------------------------------------
+# FL: front-load the market list. The engine processes both players' order i
+# unit by unit at the same quote, so list position is race priority. The new
+# public files (ahmedberatozer V46/V47 EXP293 after sdy623 / jaxa623 "Beyond
+# 48-0") put their sales at index 0; with ours further down the list they sold
+# the same strawberries at the same hour for $145 against our $130 (seed 5, day
+# 24). From day 6: sales first, then product purchases together with the sales
+# of the items they buy (the wheat round trip keeps its internal order), then
+# everything else; each group keeps its original order, nothing is added or
+# re-priced. Measured paired vs Zeus: +$368 ± 70 on V47 / jaxa623 / alperen
+# (wins 59 -> 65 of 72), +$186 ± 36 on the seven-opponent legacy set (positive
+# on every opponent), p2close +153, ladder26 +148, se18 +99. Advancing the
+# sales themselves (3-24 turns, with or without a rival-dump gate) measured
+# negative and is not included.
+# ---------------------------------------------------------------------------
+_FL_PARENT = agent
+del agent
+_FL_FROM_STEP = 144
+_FL_STATS = {"turns": 0, "errors": 0}
+
+
+def _fl_frontload(obs, action):
+    market = [list(o) for o in (action.get("market") or []) if o]
+    if len(market) < 2 or int(obs["step"]) < _FL_FROM_STEP:
+        return action
+    buys = {o[1] for o in market if len(o) > 1 and o[0] == "BUY_PRODUCT"}
+    front = [o for o in market if len(o) >= 3 and o[0] == "SELL" and o[1] not in buys]
+    mid = [o for o in market if len(o) >= 3 and (o[0] == "BUY_PRODUCT" or (o[0] == "SELL" and o[1] in buys))]
+    rest = [o for o in market if o not in front and o not in mid]
+    new = front + mid + rest
+    if new == market:
+        return action
+    _FL_STATS["turns"] += 1
+    return dict(action, market=new)
+
+
+def agent(observation, configuration=None):
+    action = _FL_PARENT(observation, configuration)
+    try:
+        action = _fl_frontload(observation, action)
+    except Exception:  # noqa: BLE001
+        _FL_STATS["errors"] += 1
+    return action
+
 
 # ---------------------------------------------------------------------------
 # DF: day-start seller flag. Opponent sales per step of sell-only products are
