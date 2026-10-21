@@ -1,0 +1,13 @@
+[package]
+name = "kaggsim"
+version = "0.1.0"
+edition = "2021"
+description = "Fast Rust port of the Kaggriculture game engine (kaggle-environments 1.32.7)"
+license = "Apache-2.0"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
